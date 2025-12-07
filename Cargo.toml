@@ -1,0 +1,11 @@
+[package]
+name = "RustDAC"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aec3 = "0.1.2"
+anyhow = "1.0.100"
+cpal = "0.16.0"
+crossbeam-channel = "0.5.15"
+wasapi = "0.22.0"
