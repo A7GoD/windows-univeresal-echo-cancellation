@@ -101,7 +101,6 @@ fn processing_thread(
         aec3.process_capture(&mut audio_buf, false);
         audio_buf.merge_frequency_bands();
 
-        if last_metrics.elapsed() >= metrics_interval {
             let metrics = aec3.metrics();
             println!("AEC metrics: {:?}", metrics);
             last_metrics = std::time::Instant::now();
@@ -113,6 +112,16 @@ fn processing_thread(
         audio_buf.copy_to_stream(&stream_config, &mut out_refs);
         let mut out_refs_immut: Vec<&[f32]> = out_refs.iter().map(|r| &**r).collect();
         channels_to_interleaved(&mut out_refs_immut, &mut output);
+
+        // Apply output gain
+        const GAIN: f32 = 5.0;
+        let mut max_amp = 0.0f32;
+        for sample in output.iter_mut() {
+            *sample *= GAIN;
+            if sample.abs() > max_amp {
+                max_amp = sample.abs();
+            }
+        }
 
         let _ = tx_out.try_send(output.clone());
     }
