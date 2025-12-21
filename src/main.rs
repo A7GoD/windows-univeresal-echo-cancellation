@@ -52,9 +52,25 @@ fn processing_thread(
 
     while let Ok(frame) = rx_in.recv() {
         // Render path (real speaker)
-        if let Ok(render_frame) = rx_render.recv() {
+        // Render path (real speaker)
+        let mut render_received = false;
+        while let Ok(render_frame) = rx_render.try_recv() {
+            render_received = true;
             let per_channel_render =
                 interleaved_to_channels(&render_frame, channels, stream_config.num_frames());
+            let refs_render: Vec<&[f32]> =
+                per_channel_render.iter().map(|v| v.as_slice()).collect();
+            render_buf.copy_from(&refs_render, &stream_config);
+            render_buf.split_into_frequency_bands();
+            aec3.analyze_render(&mut render_buf);
+            render_buf.merge_frequency_bands();
+        }
+
+        if !render_received {
+            // Feed silence to keep AEC state valid
+            let silence = vec![0.0f32; stream_config.num_frames() * channels];
+            let per_channel_render =
+                interleaved_to_channels(&silence, channels, stream_config.num_frames());
             let refs_render: Vec<&[f32]> =
                 per_channel_render.iter().map(|v| v.as_slice()).collect();
             render_buf.copy_from(&refs_render, &stream_config);
@@ -89,7 +105,6 @@ fn processing_thread(
             let metrics = aec3.metrics();
             println!("AEC metrics: {:?}", metrics);
             last_metrics = std::time::Instant::now();
-        }
 
         // Copy processed audio to interleaved
         let mut output = vec![0f32; frame.len()];
