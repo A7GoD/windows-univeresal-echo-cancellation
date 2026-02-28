@@ -1,6 +1,13 @@
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{prelude::*, widgets::*};
 use std::thread;
+use sysinfo::System;
 
 use aec3::audio_processing::audio_buffer::AudioBuffer;
 use aec3::audio_processing::high_pass_filter::HighPassFilter;
@@ -34,6 +41,7 @@ fn processing_thread(
     rx_in: Receiver<Vec<f32>>,
     rx_render: Receiver<Vec<f32>>,
     tx_out: Sender<Vec<f32>>,
+    tx_metrics: Sender<String>,
     sample_rate: usize,
     channels: usize,
 ) {
@@ -45,7 +53,7 @@ fn processing_thread(
     let stream_config = StreamConfig::new(sample_rate as i32, channels, false);
 
     let mut last_metrics = std::time::Instant::now();
-    let metrics_interval = std::time::Duration::from_secs(5);
+    let metrics_interval = std::time::Duration::from_millis(100);
 
     let mut render_buf =
         AudioBuffer::from_sample_rates(sample_rate, channels, sample_rate, channels, sample_rate);
@@ -101,9 +109,11 @@ fn processing_thread(
         aec3.process_capture(&mut audio_buf, false);
         audio_buf.merge_frequency_bands();
 
+        if last_metrics.elapsed() >= metrics_interval {
             let metrics = aec3.metrics();
-            println!("AEC metrics: {:?}", metrics);
+            let _ = tx_metrics.try_send(format!("{:#?}", metrics));
             last_metrics = std::time::Instant::now();
+        }
 
         // Copy processed audio to interleaved
         let mut output = vec![0f32; frame.len()];
@@ -160,8 +170,18 @@ fn main() -> Result<()> {
     let (tx_in, rx_in) = bounded::<Vec<f32>>(16);
     let (tx_out, rx_out) = bounded::<Vec<f32>>(16);
     let (tx_render, rx_render) = bounded::<Vec<f32>>(16);
+    let (tx_metrics, rx_metrics) = bounded::<String>(2);
 
-    thread::spawn(move || processing_thread(rx_in, rx_render, tx_out, sample_rate_hz, channels));
+    thread::spawn(move || {
+        processing_thread(
+            rx_in,
+            rx_render,
+            tx_out,
+            tx_metrics,
+            sample_rate_hz,
+            channels,
+        )
+    });
 
     // --- Input stream ---
     let in_config = cpal::StreamConfig {
@@ -223,8 +243,73 @@ fn main() -> Result<()> {
     real_output_stream.play()?;
     virtual_output_stream.play()?;
 
-    println!("Running AEC with virtual speaker output. Press Ctrl+C to exit.");
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    // Setup TUI
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+
+    let mut sys = System::new_all();
+    let pid = sysinfo::get_current_pid().unwrap();
+    let mut current_metrics = String::from("Waiting for AEC metrics...");
+
+    let app_result = (|| -> Result<()> {
+        loop {
+            // Check for new metrics without blocking
+            if let Ok(m) = rx_metrics.try_recv() {
+                current_metrics = m;
+            }
+
+            sys.refresh_all();
+            let cpu_usage = if let Some(process) = sys.process(pid) {
+                process.cpu_usage()
+            } else {
+                0.0
+            };
+
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+                    .split(f.area());
+
+                let header_text = format!(
+                    "RustDAC TUI | PID: {} | Process CPU Usage: {:.2}%",
+                    pid, cpu_usage
+                );
+                let header = Paragraph::new(header_text)
+                    .block(Block::default().borders(Borders::ALL).title("Status"))
+                    .style(Style::default().fg(Color::Cyan));
+                f.render_widget(header, chunks[0]);
+
+                let metrics_paragraph = Paragraph::new(current_metrics.as_str())
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Live AEC Metrics"),
+                    )
+                    .wrap(Wrap { trim: false });
+                f.render_widget(metrics_paragraph, chunks[1]);
+            })?;
+
+            if event::poll(std::time::Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.code == KeyCode::Char('q') {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    app_result?;
+
+    Ok(())
 }
