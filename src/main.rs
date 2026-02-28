@@ -142,12 +142,13 @@ fn find_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
         .find(|d| d.name().ok().as_deref() == Some(name))
 }
 
-fn main() -> Result<()> {
+fn run_logic() -> Result<bool> {
     let host = cpal::default_host();
 
-    let input_device = host
-        .default_input_device()
-        .expect("No input device available");
+    let input_device = match host.default_input_device() {
+        Some(d) => d,
+        None => return Ok(true), // returning true means we'll retry
+    };
 
     // Real speaker device (used for ANC only)
     // let real_speaker_device = host
@@ -160,8 +161,10 @@ fn main() -> Result<()> {
     //     .expect("No virtual speaker device available"); // Replace with virtual device selection
     const VIRTUAL_MIC: &str = "CABLE In 16 Ch (VB-Audio Virtual Cable)";
 
-    let virtual_speaker_device =
-        find_device_by_name(&host, VIRTUAL_MIC).expect("No virtual mic found");
+    let virtual_speaker_device = match find_device_by_name(&host, VIRTUAL_MIC) {
+        Some(d) => d,
+        None => return Ok(true),
+    };
 
     let sample_rate_hz = 48_000;
     let channels = 2usize;
@@ -171,6 +174,7 @@ fn main() -> Result<()> {
     let (tx_out, rx_out) = bounded::<Vec<f32>>(16);
     let (tx_render, rx_render) = bounded::<Vec<f32>>(16);
     let (tx_metrics, rx_metrics) = bounded::<String>(2);
+    let (tx_err, rx_err) = bounded::<()>(1);
 
     thread::spawn(move || {
         processing_thread(
@@ -196,13 +200,20 @@ fn main() -> Result<()> {
             let vec = data.to_vec();
             let _ = tx_in_clone.try_send(vec);
         },
-        move |err| eprintln!("input stream error: {:?}", err),
+        {
+            let tx_err = tx_err.clone();
+            move |err| {
+                eprintln!("input stream error: {:?}", err);
+                let _ = tx_err.try_send(());
+            }
+        },
         None,
     )?;
 
-    let render_device = host
-        .default_output_device()
-        .expect("No output device available");
+    let render_device = match host.default_output_device() {
+        Some(d) => d,
+        None => return Ok(true),
+    };
     // --- Real speaker stream (ANC render) ---
     let stream_config: cpal::StreamConfig = cpal::StreamConfig {
         channels: channels as u16,
@@ -215,7 +226,13 @@ fn main() -> Result<()> {
         move |out: &[f32], _: &cpal::InputCallbackInfo| {
             let _ = tx_render_clone.send(out.to_vec());
         },
-        move |err| eprintln!("real output stream error: {:?}", err),
+        {
+            let tx_err = tx_err.clone();
+            move |err| {
+                eprintln!("real output stream error: {:?}", err);
+                let _ = tx_err.try_send(());
+            }
+        },
         None,
     )?;
 
@@ -235,7 +252,13 @@ fn main() -> Result<()> {
                 }
             }
         },
-        move |err| eprintln!("virtual output stream error: {:?}", err),
+        {
+            let tx_err = tx_err.clone();
+            move |err| {
+                eprintln!("virtual output stream error: {:?}", err);
+                let _ = tx_err.try_send(());
+            }
+        },
         None,
     )?;
 
@@ -253,8 +276,14 @@ fn main() -> Result<()> {
     let pid = sysinfo::get_current_pid().unwrap();
     let mut current_metrics = String::from("Waiting for AEC metrics...");
 
+    let mut should_restart = false;
     let app_result = (|| -> Result<()> {
         loop {
+            if rx_err.try_recv().is_ok() {
+                should_restart = true;
+                break;
+            }
+
             // Check for new metrics without blocking
             if let Ok(m) = rx_metrics.try_recv() {
                 current_metrics = m;
@@ -311,5 +340,24 @@ fn main() -> Result<()> {
 
     app_result?;
 
+    Ok(should_restart)
+}
+
+fn main() -> Result<()> {
+    loop {
+        match run_logic() {
+            Ok(true) => {
+                println!("Audio device changed or error occurred. Restarting in 1s...");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Ok(false) => {
+                break; // Normal exit via 'q'
+            }
+            Err(e) => {
+                eprintln!("Application error: {:?}. Restarting in 1s...", e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
     Ok(())
 }
