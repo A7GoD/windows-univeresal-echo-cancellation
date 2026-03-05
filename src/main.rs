@@ -224,7 +224,7 @@ fn run_logic() -> Result<bool> {
     let real_output_stream = render_device.build_input_stream(
         &stream_config,
         move |out: &[f32], _: &cpal::InputCallbackInfo| {
-            let _ = tx_render_clone.send(out.to_vec());
+            let _ = tx_render_clone.try_send(out.to_vec());
         },
         {
             let tx_err = tx_err.clone();
@@ -240,7 +240,7 @@ fn run_logic() -> Result<bool> {
     let virtual_output_stream = virtual_speaker_device.build_output_stream(
         &stream_config,
         move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            if let Ok(frame) = rx_out.recv() {
+            if let Ok(frame) = rx_out.try_recv() {
                 let len = out.len().min(frame.len());
                 out[..len].copy_from_slice(&frame[..len]);
                 for s in out[len..].iter_mut() {
@@ -276,6 +276,9 @@ fn run_logic() -> Result<bool> {
     let pid = sysinfo::get_current_pid().unwrap();
     let mut current_metrics = String::from("Waiting for AEC metrics...");
 
+    let mut last_sys_refresh = std::time::Instant::now();
+    let mut current_cpu_usage = 0.0;
+
     let mut should_restart = false;
     let app_result = (|| -> Result<()> {
         loop {
@@ -285,16 +288,21 @@ fn run_logic() -> Result<bool> {
             }
 
             // Check for new metrics without blocking
-            if let Ok(m) = rx_metrics.try_recv() {
+            while let Ok(m) = rx_metrics.try_recv() {
                 current_metrics = m;
             }
 
-            sys.refresh_all();
-            let cpu_usage = if let Some(process) = sys.process(pid) {
-                process.cpu_usage()
-            } else {
-                0.0
-            };
+            if last_sys_refresh.elapsed() >= std::time::Duration::from_millis(500) {
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::nothing().with_cpu(),
+                );
+                if let Some(process) = sys.process(pid) {
+                    current_cpu_usage = process.cpu_usage();
+                }
+                last_sys_refresh = std::time::Instant::now();
+            }
 
             terminal.draw(|f| {
                 let chunks = Layout::default()
@@ -305,7 +313,7 @@ fn run_logic() -> Result<bool> {
 
                 let header_text = format!(
                     "RustDAC TUI | PID: {} | Process CPU Usage: {:.2}%",
-                    pid, cpu_usage
+                    pid, current_cpu_usage
                 );
                 let header = Paragraph::new(header_text)
                     .block(Block::default().borders(Borders::ALL).title("Status"))
