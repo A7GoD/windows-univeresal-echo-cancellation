@@ -15,16 +15,19 @@ use aec3::audio_processing::stream_config::StreamConfig;
 use aec3::{api::EchoControl, audio_processing::aec3::echo_canceller3::EchoCanceller3};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-fn interleaved_to_channels(interleaved: &[f32], channels: usize, frames: usize) -> Vec<Vec<f32>> {
+fn interleaved_to_channels(
+    interleaved: &[f32],
+    channels: usize,
+    frames: usize,
+    out: &mut [Vec<f32>],
+) {
     let avail_frames = interleaved.len() / channels;
-    let mut out = vec![vec![0f32; frames]; channels];
     let copy_frames = std::cmp::min(avail_frames, frames);
     for frame in 0..copy_frames {
         for ch in 0..channels {
             out[ch][frame] = interleaved[frame * channels + ch];
         }
     }
-    out
 }
 
 fn channels_to_interleaved(channels_data: &mut [&[f32]], out: &mut [f32]) {
@@ -58,16 +61,24 @@ fn processing_thread(
     let mut render_buf =
         AudioBuffer::from_sample_rates(sample_rate, channels, sample_rate, channels, sample_rate);
 
+    let mut hp_filter = HighPassFilter::new(sample_rate as i32, channels);
+    let num_frames = stream_config.num_frames();
+
+    // Pre-allocate buffers to avoid allocations in the hot loop
+    let mut render_channels = vec![vec![0f32; num_frames]; channels];
+    let mut capture_channels = vec![vec![0f32; num_frames]; channels];
+    let silence = vec![0.0f32; num_frames * channels];
+    let mut hp_filter_channels: Vec<Vec<f32>> = vec![Vec::new(); channels];
+    let mut output = vec![0f32; num_frames * channels];
+    let mut out_mut = vec![vec![0f32; num_frames]; channels];
+
     while let Ok(frame) = rx_in.recv() {
-        // Render path (real speaker)
         // Render path (real speaker)
         let mut render_received = false;
         while let Ok(render_frame) = rx_render.try_recv() {
             render_received = true;
-            let per_channel_render =
-                interleaved_to_channels(&render_frame, channels, stream_config.num_frames());
-            let refs_render: Vec<&[f32]> =
-                per_channel_render.iter().map(|v| v.as_slice()).collect();
+            interleaved_to_channels(&render_frame, channels, num_frames, &mut render_channels);
+            let refs_render: Vec<&[f32]> = render_channels.iter().map(|v| v.as_slice()).collect();
             render_buf.copy_from(&refs_render, &stream_config);
             render_buf.split_into_frequency_bands();
             aec3.analyze_render(&mut render_buf);
@@ -76,11 +87,8 @@ fn processing_thread(
 
         if !render_received {
             // Feed silence to keep AEC state valid
-            let silence = vec![0.0f32; stream_config.num_frames() * channels];
-            let per_channel_render =
-                interleaved_to_channels(&silence, channels, stream_config.num_frames());
-            let refs_render: Vec<&[f32]> =
-                per_channel_render.iter().map(|v| v.as_slice()).collect();
+            interleaved_to_channels(&silence, channels, num_frames, &mut render_channels);
+            let refs_render: Vec<&[f32]> = render_channels.iter().map(|v| v.as_slice()).collect();
             render_buf.copy_from(&refs_render, &stream_config);
             render_buf.split_into_frequency_bands();
             aec3.analyze_render(&mut render_buf);
@@ -88,17 +96,21 @@ fn processing_thread(
         }
 
         // Capture path (mic)
-        let per_channel = interleaved_to_channels(&frame, channels, stream_config.num_frames());
-        let refs: Vec<&[f32]> = per_channel.iter().map(|v| v.as_slice()).collect();
+        interleaved_to_channels(&frame, channels, num_frames, &mut capture_channels);
+        let refs: Vec<&[f32]> = capture_channels.iter().map(|v| v.as_slice()).collect();
         audio_buf.copy_from(&refs, &stream_config);
 
         aec3.analyze_capture(&mut audio_buf);
         audio_buf.split_into_frequency_bands();
 
-        let mut hp_filter_channels: Vec<Vec<f32>> = (0..channels)
-            .map(|ch| audio_buf.split_band(ch, 0).to_vec())
-            .collect();
-        let mut hp_filter = HighPassFilter::new(sample_rate as i32, channels);
+        for ch in 0..channels {
+            let band = audio_buf.split_band(ch, 0);
+            if hp_filter_channels[ch].len() != band.len() {
+                hp_filter_channels[ch].resize(band.len(), 0.0);
+            }
+            hp_filter_channels[ch].copy_from_slice(band);
+        }
+
         hp_filter.process(&mut hp_filter_channels);
         for ch in 0..channels {
             let dst = audio_buf.split_band_mut(ch, 0);
@@ -116,8 +128,6 @@ fn processing_thread(
         }
 
         // Copy processed audio to interleaved
-        let mut output = vec![0f32; frame.len()];
-        let mut out_mut: Vec<Vec<f32>> = vec![vec![0f32; audio_buf.num_frames()]; channels];
         let mut out_refs: Vec<&mut [f32]> = out_mut.iter_mut().map(|v| v.as_mut_slice()).collect();
         audio_buf.copy_to_stream(&stream_config, &mut out_refs);
         let mut out_refs_immut: Vec<&[f32]> = out_refs.iter().map(|r| &**r).collect();
