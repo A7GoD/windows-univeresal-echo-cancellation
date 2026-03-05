@@ -12,3 +12,4 @@ crossterm = "0.29.0"
 ratatui = "0.30.0"
 sysinfo = "0.38.2"
 wasapi = "0.22.0"
+windows = { version = "0.62.2", features = ["Win32_System_Threading", "Win32_Foundation"] }

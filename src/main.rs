@@ -15,6 +15,34 @@ use aec3::audio_processing::stream_config::StreamConfig;
 use aec3::{api::EchoControl, audio_processing::aec3::echo_canceller3::EchoCanceller3};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+#[cfg(windows)]
+fn enable_efficiency_mode() {
+    use std::ffi::c_void;
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, IDLE_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+    };
+
+    unsafe {
+        // Set idle priority class to prefer E-cores
+        let _ = SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+
+        // Explicitly enable EcoQoS (Efficiency mode in Task Manager)
+        let mut state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        };
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &mut state as *mut _ as *mut c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
 fn interleaved_to_channels(
     interleaved: &[f32],
     channels: usize,
@@ -362,6 +390,9 @@ fn run_logic() -> Result<bool> {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    enable_efficiency_mode();
+
     loop {
         match run_logic() {
             Ok(true) => {
