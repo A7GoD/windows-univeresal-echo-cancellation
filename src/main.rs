@@ -1,3 +1,4 @@
+use aec3::api::config::{EchoCanceller3Config, MaskingThresholds, Tuning};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossterm::{
@@ -12,8 +13,114 @@ use sysinfo::System;
 use aec3::audio_processing::audio_buffer::AudioBuffer;
 use aec3::audio_processing::high_pass_filter::HighPassFilter;
 use aec3::audio_processing::stream_config::StreamConfig;
-use aec3::{api::EchoControl, audio_processing::aec3::echo_canceller3::EchoCanceller3};
+use aec3::{
+    api::EchoControl,
+    audio_processing::aec3::echo_canceller3::EchoCanceller3,
+};
+
+// ---------------------------------------------------------------------------
+// AEC Suppression Presets
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AecPreset {
+    Transparent,
+    Aggressive,
+}
+
+impl AecPreset {
+    const ALL: [AecPreset; 2] = [AecPreset::Transparent, AecPreset::Aggressive];
+
+    fn name(self) -> &'static str {
+        match self {
+            AecPreset::Transparent => "Transparent",
+            AecPreset::Aggressive => "Aggressive",
+        }
+    }
+
+    fn next(self) -> AecPreset {
+        let idx = AecPreset::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        AecPreset::ALL[(idx + 1) % AecPreset::ALL.len()]
+    }
+
+    /// Build an EchoCanceller3Config tuned for this preset.
+    fn apply_to(self, cfg: &mut EchoCanceller3Config) {
+        match self {
+            // Suppressor almost fully disabled — passes voice through unaltered.
+            AecPreset::Transparent => {
+                cfg.suppressor.normal_tuning = Tuning::new(
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    4.0,
+                    0.5,
+                );
+                cfg.suppressor.nearend_tuning = Tuning::new(
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    4.0,
+                    0.5,
+                );
+                cfg.ep_strength.default_gain = 0.0;
+                cfg.ep_strength.bounded_erl = true;
+            }
+
+            // Strong echo cancellation with reduced NLP to preserve voice clarity.
+            // Masking thresholds at moderate values (vs. extreme 0.1 for max suppression)
+            // so the post-filter doesn't over-suppress near-end speech.
+            AecPreset::Aggressive => {
+                cfg.suppressor.nearend_tuning = Tuning::new(
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    MaskingThresholds::new(10.0, 15.0, 5.0),
+                    4.0,
+                    0.5,
+                );
+            }
+        }
+    }
+
+    fn build_config(self, channels: usize) -> EchoCanceller3Config {
+        let mut cfg = EchoCanceller3::create_default_config(channels, channels);
+        self.apply_to(&mut cfg);
+        cfg
+    }
+}
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+// ---------------------------------------------------------------------------
+// Simple first-order IIR high-pass filter
+// Removes frequencies below `cutoff_hz` (e.g. 150 Hz) to eliminate rumble.
+// y[n] = alpha * (y[n-1] + x[n] - x[n-1])
+// ---------------------------------------------------------------------------
+struct HighPass150 {
+    alpha: f32,
+    prev_x: Vec<f32>, // previous input sample per channel
+    prev_y: Vec<f32>, // previous output sample per channel
+}
+
+impl HighPass150 {
+    fn new(sample_rate: usize, channels: usize, cutoff_hz: f32) -> Self {
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
+        let dt = 1.0 / sample_rate as f32;
+        let alpha = rc / (rc + dt);
+        Self {
+            alpha,
+            prev_x: vec![0.0; channels],
+            prev_y: vec![0.0; channels],
+        }
+    }
+
+    fn process(&mut self, channels_data: &mut [Vec<f32>]) {
+        for ch in 0..channels_data.len() {
+            for s in 0..channels_data[ch].len() {
+                let x = channels_data[ch][s];
+                let y = self.alpha * (self.prev_y[ch] + x - self.prev_x[ch]);
+                self.prev_x[ch] = x;
+                self.prev_y[ch] = y;
+                channels_data[ch][s] = y;
+            }
+        }
+    }
+}
 
 #[cfg(windows)]
 fn enable_efficiency_mode() {
@@ -73,102 +180,100 @@ fn processing_thread(
     rx_render: Receiver<Vec<f32>>,
     tx_out: Sender<Vec<f32>>,
     tx_metrics: Sender<String>,
-    sample_rate: usize,
+    rx_preset: Receiver<AecPreset>,
+    sample_rate: usize, // 48 kHz — native rate for everything
     channels: usize,
 ) {
-    let cfg = EchoCanceller3::create_default_config(channels, channels);
+    // ── Frame size ────────────────────────────────────────────────────────────
+    let frames = sample_rate / 100; // 10 ms at 48 kHz = 480 frames
+
+    // ── AEC3 at native 48 kHz ─────────────────────────────────────────────────
+    let mut current_preset = AecPreset::Aggressive;
+    let cfg = current_preset.build_config(channels);
     let mut aec3 = EchoCanceller3::new(cfg, sample_rate as i32, channels, channels);
 
     let mut audio_buf =
         AudioBuffer::from_sample_rates(sample_rate, channels, sample_rate, channels, sample_rate);
     let stream_config = StreamConfig::new(sample_rate as i32, channels, false);
+    let mut render_buf =
+        AudioBuffer::from_sample_rates(sample_rate, channels, sample_rate, channels, sample_rate);
+
+    // ── Pre-allocated working buffers ─────────────────────────────────────────
+    let mut cap_buf = vec![vec![0f32; frames]; channels];
+    let mut rnd_buf = vec![vec![0f32; frames]; channels];
+    let mut out_buf = vec![vec![0f32; frames]; channels];
+    let silence = vec![0.0f32; frames * channels];
+    let mut output = vec![0f32; frames * channels];
+
+    // ── 150 Hz high-pass on capture ───────────────────────────────────────────
+    let mut hp_150 = HighPass150::new(sample_rate, channels, 150.0);
+
+    // ── aec3 HighPassFilter (applied on split band-0) ─────────────────────────
+    let mut hp_filter = HighPassFilter::new(sample_rate as i32, channels);
 
     let mut last_metrics = std::time::Instant::now();
     let metrics_interval = std::time::Duration::from_millis(100);
 
-    let mut render_buf =
-        AudioBuffer::from_sample_rates(sample_rate, channels, sample_rate, channels, sample_rate);
-
-    let mut hp_filter = HighPassFilter::new(sample_rate as i32, channels);
-    let num_frames = stream_config.num_frames();
-
-    // Pre-allocate buffers to avoid allocations in the hot loop
-    let mut render_channels = vec![vec![0f32; num_frames]; channels];
-    let mut capture_channels = vec![vec![0f32; num_frames]; channels];
-    let silence = vec![0.0f32; num_frames * channels];
-    let mut hp_filter_channels: Vec<Vec<f32>> = vec![Vec::new(); channels];
-    let mut output = vec![0f32; num_frames * channels];
-    let mut out_mut = vec![vec![0f32; num_frames]; channels];
-
     while let Ok(frame) = rx_in.recv() {
-        // Render path (real speaker)
-        let mut render_received = false;
-        while let Ok(render_frame) = rx_render.try_recv() {
-            render_received = true;
-            interleaved_to_channels(&render_frame, channels, num_frames, &mut render_channels);
-            let refs_render: Vec<&[f32]> = render_channels.iter().map(|v| v.as_slice()).collect();
-            render_buf.copy_from(&refs_render, &stream_config);
-            render_buf.split_into_frequency_bands();
-            aec3.analyze_render(&mut render_buf);
-            render_buf.merge_frequency_bands();
+        // ── Preset change ─────────────────────────────────────────────────────
+        if let Ok(new_preset) = rx_preset.try_recv() {
+            if new_preset != current_preset {
+                current_preset = new_preset;
+                let new_cfg = current_preset.build_config(channels);
+                aec3 = EchoCanceller3::new(new_cfg, sample_rate as i32, channels, channels);
+            }
         }
 
-        if !render_received {
-            // Feed silence to keep AEC state valid
-            interleaved_to_channels(&silence, channels, num_frames, &mut render_channels);
-            let refs_render: Vec<&[f32]> = render_channels.iter().map(|v| v.as_slice()).collect();
-            render_buf.copy_from(&refs_render, &stream_config);
-            render_buf.split_into_frequency_bands();
-            aec3.analyze_render(&mut render_buf);
-            render_buf.merge_frequency_bands();
-        }
+        // ── Capture: deinterleave ─────────────────────────────────────────────
+        interleaved_to_channels(&frame, channels, frames, &mut cap_buf);
 
-        // Capture path (mic)
-        interleaved_to_channels(&frame, channels, num_frames, &mut capture_channels);
-        let refs: Vec<&[f32]> = capture_channels.iter().map(|v| v.as_slice()).collect();
+        // ── Capture: 150 Hz high-pass ─────────────────────────────────────────
+        hp_150.process(&mut cap_buf);
+
+        // ── Capture: copy into AEC AudioBuffer (full-band, before split) ──────
+        let refs: Vec<&[f32]> = cap_buf.iter().map(|v| v.as_slice()).collect();
         audio_buf.copy_from(&refs, &stream_config);
-
         aec3.analyze_capture(&mut audio_buf);
         audio_buf.split_into_frequency_bands();
 
-        for ch in 0..channels {
-            let band = audio_buf.split_band(ch, 0);
-            if hp_filter_channels[ch].len() != band.len() {
-                hp_filter_channels[ch].resize(band.len(), 0.0);
-            }
-            hp_filter_channels[ch].copy_from_slice(band);
-        }
-
+        // ── Capture: AEC HPF on band-0 sub-bands ─────────────────────────────
+        let mut hp_filter_channels: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| audio_buf.split_band(ch, 0).to_vec())
+            .collect();
         hp_filter.process(&mut hp_filter_channels);
         for ch in 0..channels {
-            let dst = audio_buf.split_band_mut(ch, 0);
-            dst.copy_from_slice(&hp_filter_channels[ch]);
+            audio_buf
+                .split_band_mut(ch, 0)
+                .copy_from_slice(&hp_filter_channels[ch]);
         }
 
-        // aec3.set_audio_buffer_delay(404); // Adjust as needed
+        // ── Render: deinterleave ──────────────────────────────────────────────
+        let render_data = rx_render.try_recv().unwrap_or_else(|_| silence.clone());
+        interleaved_to_channels(&render_data, channels, frames, &mut rnd_buf);
+        let refs_render: Vec<&[f32]> = rnd_buf.iter().map(|v| v.as_slice()).collect();
+        render_buf.copy_from(&refs_render, &stream_config);
+        render_buf.split_into_frequency_bands();
+        aec3.analyze_render(&mut render_buf);
+
+        // ── AEC process ───────────────────────────────────────────────────────
         aec3.process_capture(&mut audio_buf, false);
         audio_buf.merge_frequency_bands();
 
-        if last_metrics.elapsed() >= metrics_interval {
-            let metrics = aec3.metrics();
-            let _ = tx_metrics.try_send(format!("{:#?}", metrics));
-            last_metrics = std::time::Instant::now();
+        // ── Output: copy AEC result into channel buffers ──────────────────────
+        let mut out_refs: Vec<&mut [f32]> = out_buf.iter_mut().map(|v| v.as_mut_slice()).collect();
+        audio_buf.copy_to_stream(&stream_config, &mut out_refs);
+
+        // ── Output: interleave + clamp ────────────────────────────────────────
+        let out_refs_immut: Vec<&[f32]> = out_buf.iter().map(|v| v.as_slice()).collect();
+        channels_to_interleaved(&mut out_refs_immut.clone(), &mut output);
+        for sample in output.iter_mut() {
+            *sample = sample.clamp(-1.0, 1.0);
         }
 
-        // Copy processed audio to interleaved
-        let mut out_refs: Vec<&mut [f32]> = out_mut.iter_mut().map(|v| v.as_mut_slice()).collect();
-        audio_buf.copy_to_stream(&stream_config, &mut out_refs);
-        let mut out_refs_immut: Vec<&[f32]> = out_refs.iter().map(|r| &**r).collect();
-        channels_to_interleaved(&mut out_refs_immut, &mut output);
-
-        // Apply output gain
-        const GAIN: f32 = 5.0;
-        let mut max_amp = 0.0f32;
-        for sample in output.iter_mut() {
-            *sample *= GAIN;
-            if sample.abs() > max_amp {
-                max_amp = sample.abs();
-            }
+        // ── Metrics ───────────────────────────────────────────────────────────
+        if last_metrics.elapsed() >= metrics_interval {
+            let _ = tx_metrics.try_send(format!("{:#?}", aec3.metrics()));
+            last_metrics = std::time::Instant::now();
         }
 
         let _ = tx_out.try_send(output.clone());
@@ -187,6 +292,9 @@ fn run_logic() -> Result<bool> {
         Some(d) => d,
         None => return Ok(true), // returning true means we'll retry
     };
+    let real_mic_name = input_device
+        .name()
+        .unwrap_or_else(|_| "Unknown".to_string());
 
     // Real speaker device (used for ANC only)
     // let real_speaker_device = host
@@ -203,8 +311,11 @@ fn run_logic() -> Result<bool> {
         Some(d) => d,
         None => return Ok(true),
     };
+    let virtual_mic_name = virtual_speaker_device
+        .name()
+        .unwrap_or_else(|_| "Unknown".to_string());
 
-    let sample_rate_hz = 48_000;
+    let sample_rate_hz = 48_000usize;
     let channels = 2usize;
     let frames_per_buffer = (sample_rate_hz / 100) as usize; // 10 ms
 
@@ -214,12 +325,15 @@ fn run_logic() -> Result<bool> {
     let (tx_metrics, rx_metrics) = bounded::<String>(2);
     let (tx_err, rx_err) = bounded::<()>(1);
 
+    let (tx_preset, rx_preset) = bounded::<AecPreset>(4);
+
     thread::spawn(move || {
         processing_thread(
             rx_in,
             rx_render,
             tx_out,
             tx_metrics,
+            rx_preset,
             sample_rate_hz,
             channels,
         )
@@ -252,6 +366,9 @@ fn run_logic() -> Result<bool> {
         Some(d) => d,
         None => return Ok(true),
     };
+    let speaker_filter_name = render_device
+        .name()
+        .unwrap_or_else(|_| "Unknown".to_string());
     // --- Real speaker stream (ANC render) ---
     let stream_config: cpal::StreamConfig = cpal::StreamConfig {
         channels: channels as u16,
@@ -313,6 +430,7 @@ fn run_logic() -> Result<bool> {
     let mut sys = System::new_all();
     let pid = sysinfo::get_current_pid().unwrap();
     let mut current_metrics = String::from("Waiting for AEC metrics...");
+    let mut current_preset = AecPreset::Aggressive;
 
     let mut last_sys_refresh = std::time::Instant::now();
     let mut current_cpu_usage = 0.0;
@@ -346,12 +464,21 @@ fn run_logic() -> Result<bool> {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .margin(1)
-                    .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
+                    .constraints(
+                        [
+                            Constraint::Length(3), // header
+                            Constraint::Min(0),    // AEC metrics
+                            Constraint::Length(5), // device status footer
+                        ]
+                        .as_ref(),
+                    )
                     .split(f.area());
 
                 let header_text = format!(
-                    "RustDAC TUI | PID: {} | Process CPU Usage: {:.2}%",
-                    pid, current_cpu_usage
+                    "RustDAC TUI | PID: {} | CPU: {:.2}% | AEC: {} (press 's' to cycle)",
+                    pid,
+                    current_cpu_usage,
+                    current_preset.name()
                 );
                 let header = Paragraph::new(header_text)
                     .block(Block::default().borders(Borders::ALL).title("Status"))
@@ -366,12 +493,49 @@ fn run_logic() -> Result<bool> {
                     )
                     .wrap(Wrap { trim: false });
                 f.render_widget(metrics_paragraph, chunks[1]);
+
+                // Device status footer
+                let footer_text = vec![
+                    Line::from(vec![
+                        Span::styled("  Real Mic      : ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(real_mic_name.as_str(), Style::default().fg(Color::Green)),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Speaker Filter: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            speaker_filter_name.as_str(),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled("  Virtual Mic   : ", Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            virtual_mic_name.as_str(),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ]),
+                ];
+                let footer = Paragraph::new(footer_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Active Devices"),
+                    )
+                    .style(Style::default());
+                f.render_widget(footer, chunks[2]);
             })?;
 
             if event::poll(std::time::Duration::from_millis(100))? {
                 if let Event::Key(key) = event::read()? {
-                    if key.code == KeyCode::Char('q') {
-                        break;
+                    if key.kind == crossterm::event::KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Char('q') => break,
+                            KeyCode::Char('s') => {
+                                current_preset = current_preset.next();
+                                let _ = tx_preset.try_send(current_preset);
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
