@@ -7,16 +7,15 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{prelude::*, widgets::*};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use sysinfo::System;
 
 use aec3::audio_processing::audio_buffer::AudioBuffer;
 use aec3::audio_processing::high_pass_filter::HighPassFilter;
 use aec3::audio_processing::stream_config::StreamConfig;
-use aec3::{
-    api::EchoControl,
-    audio_processing::aec3::echo_canceller3::EchoCanceller3,
-};
+use aec3::{api::EchoControl, audio_processing::aec3::echo_canceller3::EchoCanceller3};
 
 // ---------------------------------------------------------------------------
 // AEC Suppression Presets
@@ -150,6 +149,94 @@ fn enable_efficiency_mode() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WASAPI consumer detection
+// Returns true if at least one audio session on the "CABLE Output" capture
+// device is currently Active (i.e. an app has the virtual mic open).
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+fn has_cable_output_consumers() -> bool {
+    use windows::Win32::Media::Audio::{
+        AudioSessionStateActive, IAudioSessionEnumerator, IAudioSessionManager2,
+        IMMDeviceEnumerator, MMDeviceEnumerator, eCapture,
+    };
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    };
+
+    unsafe {
+        // COM may already be initialised on this thread; ignore the error.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        let enumerator: IMMDeviceEnumerator =
+            match CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+
+        // Enumerate all capture (microphone) endpoints.
+        use windows::Win32::Media::Audio::DEVICE_STATE;
+        let collection = match enumerator.EnumAudioEndpoints(
+            eCapture,
+            DEVICE_STATE(0x0000_0001), /* DEVICE_STATE_ACTIVE */
+        ) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let count = collection.GetCount().unwrap_or(0);
+        for i in 0..count {
+            let device = match collection.Item(i) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            // Check if this device name contains "CABLE Output".
+            use windows::Win32::System::Com::STGM;
+            let props = match device.OpenPropertyStore(STGM(0x00000000) /* STGM_READ */) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            // PKEY_Device_FriendlyName = {a45c254e-df1c-4efd-8020-67d146a850e0}, 14
+            use windows::Win32::Devices::Properties::DEVPKEY_Device_FriendlyName;
+            use windows::Win32::Foundation::PROPERTYKEY;
+            let name_prop = match props
+                .GetValue(&DEVPKEY_Device_FriendlyName as *const _ as *const PROPERTYKEY)
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let name = name_prop.Anonymous.Anonymous.Anonymous.pwszVal;
+            // pwszVal is a PWSTR; call to_string() on it directly.
+            let name_str = name.to_string().unwrap_or_default();
+            if !name_str.contains("CABLE Output") {
+                continue;
+            }
+
+            // Found the CABLE Output device. Get the session manager via IMMDevice::Activate.
+            let session_mgr: IAudioSessionManager2 = match device.Activate(CLSCTX_ALL, None) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let enumerator2: IAudioSessionEnumerator = match session_mgr.GetSessionEnumerator() {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let session_count = enumerator2.GetCount().unwrap_or(0);
+            for j in 0..session_count {
+                if let Ok(ctrl) = enumerator2.GetSession(j) {
+                    if let Ok(state) = ctrl.GetState() {
+                        if state == AudioSessionStateActive {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
 fn interleaved_to_channels(
     interleaved: &[f32],
     channels: usize,
@@ -181,8 +268,15 @@ fn processing_thread(
     tx_out: Sender<Vec<f32>>,
     tx_metrics: Sender<String>,
     rx_preset: Receiver<AecPreset>,
-    sample_rate: usize, // 48 kHz — native rate for everything
+    sample_rate: usize,
     channels: usize,
+    sleeping: Arc<AtomicBool>,
+    no_consumers: Arc<AtomicBool>,
+    // Calibration / threshold atomics
+    current_rms_atomic: Arc<AtomicU32>,
+    silence_threshold_atomic: Arc<AtomicU32>,
+    calibrate_trigger: Arc<AtomicBool>,
+    calibrating: Arc<AtomicBool>,
 ) {
     // ── Frame size ────────────────────────────────────────────────────────────
     let frames = sample_rate / 100; // 10 ms at 48 kHz = 480 frames
@@ -214,7 +308,24 @@ fn processing_thread(
     let mut last_metrics = std::time::Instant::now();
     let metrics_interval = std::time::Duration::from_millis(100);
 
+    // ── Sleep-mode parameters ─────────────────────────────────────────────────
+    // Park the thread after this many consecutive silent frames.
+    // At 480 frames / 10 ms each → 20 frames = 200 ms of silence.
+    // The threshold is dynamic — loaded each frame from the shared atomic.
+    const SLEEP_FRAMES: u32 = 200; // 200 ms at 100 fps
+    let mut silent_frame_count: u32 = 0;
+
+    // ── Calibration state ─────────────────────────────────────────────────────
+    const CAL_FRAMES: u32 = 200; // 2 s of ambient sampling
+    let mut cal_count: u32 = 0;
+    let mut cal_sum: f32 = 0.0;
+
     while let Ok(frame) = rx_in.recv() {
+        // ── Wake-up: if we were sleeping, clear the flag and reset counter ────
+        if sleeping.load(Ordering::Relaxed) {
+            sleeping.store(false, Ordering::Relaxed);
+            silent_frame_count = 0;
+        }
         // ── Preset change ─────────────────────────────────────────────────────
         if let Ok(new_preset) = rx_preset.try_recv() {
             if new_preset != current_preset {
@@ -277,6 +388,66 @@ fn processing_thread(
         }
 
         let _ = tx_out.try_send(output.clone());
+
+        // ── Compute frame RMS ─────────────────────────────────────────────────
+        let rms: f32 = {
+            let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
+            (sum_sq / frame.len().max(1) as f32).sqrt()
+        };
+        // Publish for TUI display.
+        current_rms_atomic.store(rms.to_bits(), Ordering::Relaxed);
+
+        // ── Calibration ───────────────────────────────────────────────────────
+        if calibrate_trigger.load(Ordering::Relaxed) {
+            calibrating.store(true, Ordering::Relaxed);
+            cal_sum += rms;
+            cal_count += 1;
+            if cal_count >= CAL_FRAMES {
+                let avg = cal_sum / CAL_FRAMES as f32;
+                // New threshold = 2× ambient average (headroom), minimum 0.001.
+                let new_threshold = (avg * 2.0).max(0.001_f32);
+                silence_threshold_atomic.store(new_threshold.to_bits(), Ordering::Relaxed);
+                calibrate_trigger.store(false, Ordering::Relaxed);
+                calibrating.store(false, Ordering::Relaxed);
+                cal_count = 0;
+                cal_sum = 0.0;
+            }
+        }
+
+        // ── Sleep gate: no consumers → park immediately ────────────────────────
+        if no_consumers.load(Ordering::Relaxed) {
+            sleeping.store(true, Ordering::Relaxed);
+            while no_consumers.load(Ordering::Relaxed) || sleeping.load(Ordering::Relaxed) {
+                thread::park();
+            }
+            silent_frame_count = 0;
+            continue;
+        }
+
+        // Read the current (possibly just-calibrated) threshold.
+        let silence_threshold = f32::from_bits(silence_threshold_atomic.load(Ordering::Relaxed));
+
+        // Don't sleep while calibration is running — it needs frames to complete.
+        if !calibrate_trigger.load(Ordering::Relaxed) {
+            if rms < silence_threshold {
+                silent_frame_count = silent_frame_count.saturating_add(1);
+                if silent_frame_count >= SLEEP_FRAMES {
+                    sleeping.store(true, Ordering::Relaxed);
+                    // Park until the input callback or watcher wakes us.
+                    while sleeping.load(Ordering::Relaxed) {
+                        thread::park();
+                    }
+                    // Must reset here: the input callback clears `sleeping` before
+                    // unparking, so the top-of-loop check sees false and won't reset.
+                    silent_frame_count = 0;
+                }
+            } else {
+                silent_frame_count = 0;
+            }
+        } else {
+            // Calibrating — keep the counter zeroed so sleep kicks in fresh after.
+            silent_frame_count = 0;
+        }
     }
 }
 fn find_device_by_name(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
@@ -327,7 +498,38 @@ fn run_logic() -> Result<bool> {
 
     let (tx_preset, rx_preset) = bounded::<AecPreset>(4);
 
-    thread::spawn(move || {
+    // ── Sleep-mode shared state ───────────────────────────────────────────────
+    let sleeping = Arc::new(AtomicBool::new(false));
+    let sleeping_proc = Arc::clone(&sleeping);
+    let sleeping_input = Arc::clone(&sleeping);
+
+    // ── Consumer-watcher: poll WASAPI every 2 s ───────────────────────────────
+    // Starts true (pessimistic) so we don't spin until the first poll completes.
+    let no_consumers = Arc::new(AtomicBool::new(true));
+    let no_consumers_proc = Arc::clone(&no_consumers);
+    let no_consumers_tui = Arc::clone(&no_consumers);
+
+    // ── Ambient calibration state ─────────────────────────────────────────────
+    // Default threshold = 0.02 (~-34 dBFS). Will be overwritten after first cal.
+    let default_threshold: f32 = 0.02;
+    let silence_threshold_atomic = Arc::new(AtomicU32::new(default_threshold.to_bits()));
+    let silence_threshold_proc = Arc::clone(&silence_threshold_atomic);
+    let silence_threshold_tui = Arc::clone(&silence_threshold_atomic);
+
+    let current_rms_atomic = Arc::new(AtomicU32::new(0u32));
+    let current_rms_proc = Arc::clone(&current_rms_atomic);
+    let current_rms_tui = Arc::clone(&current_rms_atomic);
+
+    // Start true so calibration runs immediately on startup.
+    let calibrate_trigger = Arc::new(AtomicBool::new(true));
+    let calibrate_trigger_proc = Arc::clone(&calibrate_trigger);
+    let calibrate_trigger_tui = Arc::clone(&calibrate_trigger);
+
+    let calibrating = Arc::new(AtomicBool::new(false));
+    let calibrating_proc = Arc::clone(&calibrating);
+    let calibrating_tui = Arc::clone(&calibrating);
+
+    let proc_handle = thread::spawn(move || {
         processing_thread(
             rx_in,
             rx_render,
@@ -336,7 +538,36 @@ fn run_logic() -> Result<bool> {
             rx_preset,
             sample_rate_hz,
             channels,
+            sleeping_proc,
+            no_consumers_proc,
+            current_rms_proc,
+            silence_threshold_proc,
+            calibrate_trigger_proc,
+            calibrating_proc,
         )
+    });
+
+    // Keep the JoinHandle so the watcher can unpark the processing thread.
+    // We pass only Thread (cheaply cloneable) to the watcher closure.
+    let proc_thread = proc_handle.thread().clone();
+
+    thread::spawn(move || {
+        loop {
+            #[cfg(windows)]
+            let consumers = has_cable_output_consumers();
+            #[cfg(not(windows))]
+            let consumers = true; // non-Windows: assume always active
+
+            let was_empty = no_consumers.load(Ordering::Relaxed);
+            no_consumers.store(!consumers, Ordering::Relaxed);
+
+            // If a consumer just appeared, unpark the processing thread.
+            if was_empty && consumers {
+                proc_thread.unpark();
+            }
+
+            thread::sleep(std::time::Duration::from_secs(2));
+        }
     });
 
     // --- Input stream ---
@@ -346,11 +577,24 @@ fn run_logic() -> Result<bool> {
         buffer_size: cpal::BufferSize::Fixed(frames_per_buffer as u32),
     };
     let tx_in_clone = tx_in.clone();
+    // Share threshold with the input callback so silent frames don't wake the thread.
+    let silence_threshold_input = Arc::clone(&silence_threshold_atomic);
     let input_stream = input_device.build_input_stream(
         &in_config,
         move |data: &[f32], _| {
-            let vec = data.to_vec();
-            let _ = tx_in_clone.try_send(vec);
+            // Only wake the sleeping processing thread when the incoming audio is
+            // actually above the silence threshold. Silent frames keep being queued
+            // (and dropped if the channel is full) without disturbing the sleeper.
+            if sleeping_input.load(Ordering::Relaxed) {
+                let threshold = f32::from_bits(silence_threshold_input.load(Ordering::Relaxed));
+                let sum_sq: f32 = data.iter().map(|&s| s * s).sum();
+                let rms = (sum_sq / data.len().max(1) as f32).sqrt();
+                if rms > threshold {
+                    sleeping_input.store(false, Ordering::Relaxed);
+                    proc_handle.thread().unpark();
+                }
+            }
+            let _ = tx_in_clone.try_send(data.to_vec());
         },
         {
             let tx_err = tx_err.clone();
@@ -467,6 +711,7 @@ fn run_logic() -> Result<bool> {
                     .constraints(
                         [
                             Constraint::Length(3), // header
+                            Constraint::Length(3), // ambient calibration bar
                             Constraint::Min(0),    // AEC metrics
                             Constraint::Length(5), // device status footer
                         ]
@@ -474,15 +719,68 @@ fn run_logic() -> Result<bool> {
                     )
                     .split(f.area());
 
+                // ── Ambient calibration panel ─────────────────────────────────
+                let rms_now = f32::from_bits(current_rms_tui.load(Ordering::Relaxed));
+                let threshold_now = f32::from_bits(silence_threshold_tui.load(Ordering::Relaxed));
+                let is_calibrating = calibrating_tui.load(Ordering::Relaxed);
+
+                // Convert to dBFS (floor at -80 dB).
+                let to_db = |r: f32| if r > 0.0 { 20.0 * r.log10() } else { -80.0_f32 };
+                let rms_db = to_db(rms_now);
+                let thr_db = to_db(threshold_now);
+
+                // Build a 20-character bar from -60 dB to 0 dB.
+                const BAR_LEN: usize = 20;
+                const DB_MIN: f32 = -60.0;
+                const DB_MAX: f32 = 0.0;
+                let filled = (((rms_db - DB_MIN) / (DB_MAX - DB_MIN)).clamp(0.0, 1.0)
+                    * BAR_LEN as f32) as usize;
+                let bar: String = "█".repeat(filled) + &"░".repeat(BAR_LEN - filled);
+
+                let cal_status = if is_calibrating {
+                    " ⏳ CALIBRATING...".to_string()
+                } else {
+                    format!(" Threshold: {:.1} dB  ('c' to recalibrate)", thr_db)
+                };
+                let ambient_text = format!(" Level: {:>6.1} dB  [{}]{}", rms_db, bar, cal_status);
+                let ambient_color = if is_calibrating {
+                    Color::Yellow
+                } else if rms_now < threshold_now {
+                    Color::DarkGray
+                } else {
+                    Color::Green
+                };
+                let ambient_panel = Paragraph::new(ambient_text)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Ambient Level"),
+                    )
+                    .style(Style::default().fg(ambient_color));
+                f.render_widget(ambient_panel, chunks[1]);
+
+                let is_sleeping = sleeping.load(Ordering::Relaxed);
+                let no_consumers_now = no_consumers_tui.load(Ordering::Relaxed);
+                let sleep_label = match (is_sleeping, no_consumers_now) {
+                    (_, true) => "💤 NO CONSUMERS",
+                    (true, _) => "💤 SILENCE SLEEP",
+                    _ => "▶  ACTIVE       ",
+                };
                 let header_text = format!(
-                    "RustDAC TUI | PID: {} | CPU: {:.2}% | AEC: {} (press 's' to cycle)",
+                    "RustDAC TUI | PID: {} | CPU: {:.2}% | AEC: {} | {} | 's' cycle 'w' wake",
                     pid,
                     current_cpu_usage,
-                    current_preset.name()
+                    current_preset.name(),
+                    sleep_label,
                 );
+                let header_color = if is_sleeping || no_consumers_now {
+                    Color::DarkGray
+                } else {
+                    Color::Cyan
+                };
                 let header = Paragraph::new(header_text)
                     .block(Block::default().borders(Borders::ALL).title("Status"))
-                    .style(Style::default().fg(Color::Cyan));
+                    .style(Style::default().fg(header_color));
                 f.render_widget(header, chunks[0]);
 
                 let metrics_paragraph = Paragraph::new(current_metrics.as_str())
@@ -492,7 +790,7 @@ fn run_logic() -> Result<bool> {
                             .title("Live AEC Metrics"),
                     )
                     .wrap(Wrap { trim: false });
-                f.render_widget(metrics_paragraph, chunks[1]);
+                f.render_widget(metrics_paragraph, chunks[2]);
 
                 // Device status footer
                 let footer_text = vec![
@@ -522,7 +820,7 @@ fn run_logic() -> Result<bool> {
                             .title("Active Devices"),
                     )
                     .style(Style::default());
-                f.render_widget(footer, chunks[2]);
+                f.render_widget(footer, chunks[3]);
             })?;
 
             if event::poll(std::time::Duration::from_millis(100))? {
@@ -533,6 +831,15 @@ fn run_logic() -> Result<bool> {
                             KeyCode::Char('s') => {
                                 current_preset = current_preset.next();
                                 let _ = tx_preset.try_send(current_preset);
+                            }
+                            KeyCode::Char('w') => {
+                                sleeping.store(false, Ordering::Relaxed);
+                            }
+                            // Trigger ambient calibration (2 s sample).
+                            KeyCode::Char('c') => {
+                                if !calibrating_tui.load(Ordering::Relaxed) {
+                                    calibrate_trigger_tui.store(true, Ordering::Relaxed);
+                                }
                             }
                             _ => {}
                         }
